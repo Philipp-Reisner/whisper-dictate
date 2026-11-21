@@ -1,0 +1,235 @@
+#!/bin/bash
+# dictate - toggle voice dictation into the focused window (KDE Plasma, Wayland)
+#
+#   dictate [toggle]   1st call: start recording from the default PipeWire
+#                      source. 2nd call: stop, transcribe, type the text into
+#                      the focused window via dotool (uinput).
+#   dictate server     run whisper-server with the model loaded (used by the
+#                      systemd user unit dictate-server.service).
+#
+# Transcription goes to the local whisper-server when it is running (the
+# toggle starts dictate-server.service, so the model loads while you speak);
+# if it is not reachable, whisper-cli is used instead.
+#
+# Configuration: /etc/dictate.conf, then ~/.config/dictate.conf.
+
+set -u
+
+MODELDIR=/usr/share/whisper-cpp/models
+
+# Remember settings from the environment: they win over the config files.
+env_settings=$(declare -p ${!DICTATE_*} ${!DOTOOL_XKB_*} 2>/dev/null)
+
+# Defaults, see /etc/dictate.conf
+DICTATE_MODEL=
+DICTATE_LANG=auto
+DICTATE_PROMPT=
+DICTATE_OUTPUT=type
+DICTATE_THREADS=$(( $(nproc) / 2 ))
+DICTATE_SERVER=http://127.0.0.1:8178
+DICTATE_SERVER_WAIT=30
+DICTATE_AUDIO_CTX=auto
+DOTOOL_XKB_LAYOUT=
+DOTOOL_XKB_VARIANT=
+
+for conf in /etc/dictate.conf "${XDG_CONFIG_HOME:-$HOME/.config}/dictate.conf"; do
+	# shellcheck disable=SC1090
+	[ -r "$conf" ] && . "$conf"
+done
+eval "$env_settings"
+
+STATE=${XDG_RUNTIME_DIR:-/tmp}/dictate
+mkdir -p "$STATE"
+PIDFILE=$STATE/rec.pid
+WAV=$STATE/rec.wav
+NIDFILE=$STATE/notify.id
+LOG=$STATE/log
+
+# First existing model in order of preference
+pick_model() {
+	local m
+	if [ -n "$DICTATE_MODEL" ]; then
+		echo "$DICTATE_MODEL"
+		return
+	fi
+	for m in ggml-large-v3-turbo.bin ggml-large-v3.bin; do
+		[ -r "$MODELDIR/$m" ] && { echo "$MODELDIR/$m"; return; }
+	done
+	echo "dictate: no whisper model found in $MODELDIR" >&2
+	return 1
+}
+
+# dotool needs the XKB layout to type umlauts and symbols correctly:
+# KDE's own layout list first, then the system (localectl) layout.
+detect_layout() {
+	local kxkb=${XDG_CONFIG_HOME:-$HOME/.config}/kxkbrc layout= variant=
+	[ -n "$DOTOOL_XKB_LAYOUT" ] && return
+	if [ -r "$kxkb" ]; then
+		layout=$(sed -n 's/^LayoutList=//p' "$kxkb" | cut -d, -f1)
+		variant=$(sed -n 's/^VariantList=//p' "$kxkb" | cut -d, -f1)
+	fi
+	if [ -z "$layout" ]; then
+		layout=$(localectl status 2>/dev/null | sed -n 's/^ *X11 Layout: //p' | cut -d, -f1)
+		variant=$(localectl status 2>/dev/null | sed -n 's/^ *X11 Variant: //p' | cut -d, -f1)
+	fi
+	DOTOOL_XKB_LAYOUT=${layout:-us}
+	DOTOOL_XKB_VARIANT=$variant
+}
+
+notify() {	# notify <icon> <text> [extra notify-send args]
+	local icon=$1 text=$2; shift 2
+	local rid=()
+	[ -s "$NIDFILE" ] && rid=(-r "$(cat "$NIDFILE")")
+	notify-send -a Dictate -i "$icon" -p "${rid[@]}" "$@" "Dictate" "$text" \
+		> "$NIDFILE" 2>/dev/null
+}
+
+close_notify() {	# remove the "Transcribing…" notification
+	[ -s "$NIDFILE" ] || return
+	gdbus call --session -d org.freedesktop.Notifications \
+		-o /org/freedesktop/Notifications \
+		-m org.freedesktop.Notifications.CloseNotification \
+		"$(cat "$NIDFILE")" >/dev/null 2>&1
+	rm -f "$NIDFILE"
+}
+
+# Whisper always encodes a 30 s window (audio_ctx 1500 = 50/s). For short
+# recordings a smaller window is much faster; below ~2.5x the recording
+# length accuracy suffers. With whisper.cpp 1.9.5's Vulkan backend only
+# multiples of 256 work (others produce garbage), so round up to those:
+# 512 up to ~4 s, 768 up to ~6 s, 1024 up to ~8 s, 1280 up to ~10 s,
+# then the full window (0).
+audio_ctx() {
+	local bytes ctx
+	case $DICTATE_AUDIO_CTX in
+	auto)
+		bytes=$(stat -c %s "$WAV")
+		ctx=$(( (bytes - 44) * 5 * 50 / 2 / 32000 ))	# 16 kHz s16 mono, x2.5
+		ctx=$(( (ctx + 255) / 256 * 256 ))
+		[ "$ctx" -lt 512 ] && ctx=512
+		[ "$ctx" -gt 1280 ] && ctx=0
+		echo "$ctx"
+		;;
+	*)
+		echo "${DICTATE_AUDIO_CTX:-0}"
+		;;
+	esac
+}
+
+server_ready() {
+	[ -n "$DICTATE_SERVER" ] &&
+		curl -sf --max-time 1 "$DICTATE_SERVER/health" >/dev/null 2>&1
+}
+
+transcribe_server() {
+	curl -sf --max-time 300 \
+		-F "file=@$WAV" \
+		--form-string response_format=text \
+		--form-string no_timestamps=true \
+		--form-string "audio_ctx=$(audio_ctx)" \
+		--form-string "language=$DICTATE_LANG" \
+		--form-string "prompt=$DICTATE_PROMPT" \
+		"$DICTATE_SERVER/inference" 2>>"$LOG"
+}
+
+transcribe_cli() {
+	local model
+	model=$(pick_model 2>>"$LOG") || return 1
+	whisper-cli -m "$model" -l "$DICTATE_LANG" -t "$DICTATE_THREADS" -ac "$(audio_ctx)" \
+		--prompt "$DICTATE_PROMPT" -nt -np -f "$WAV" 2>>"$LOG"
+}
+
+start() {
+	rm -f "$WAV" "$NIDFILE"
+	pw-record --rate 16000 --channels 1 --format s16 "$WAV" >>"$LOG" 2>&1 &
+	echo $! > "$PIDFILE"
+	notify audio-input-microphone "🎙 Recording… press Meta+Space to stop" -u critical
+	# Load the model while the user speaks
+	if [ -n "$DICTATE_SERVER" ] && ! server_ready; then
+		systemctl --user start --no-block dictate-server.service >>"$LOG" 2>&1
+	fi
+}
+
+stop() {
+	local pid text i
+	pid=$(cat "$PIDFILE")
+	rm -f "$PIDFILE"
+	kill -INT "$pid" 2>/dev/null
+	while kill -0 "$pid" 2>/dev/null; do sleep 0.05; done
+
+	if [ ! -s "$WAV" ] || [ "$(stat -c %s "$WAV")" -lt 16000 ]; then
+		notify dialog-information "Recording too short – nothing typed" -t 2000
+		return
+	fi
+
+	notify system-run "⏳ Transcribing…" -u critical
+
+	text=
+	if [ -n "$DICTATE_SERVER" ]; then
+		# The server may still be loading the model
+		for ((i = 0; i < DICTATE_SERVER_WAIT * 4; i++)); do
+			server_ready && break
+			case $(systemctl --user is-active dictate-server.service) in
+			active|activating|reloading) ;;
+			*) break ;;
+			esac
+			sleep 0.25
+		done
+		server_ready && text=$(transcribe_server)
+	fi
+	[ -z "$text" ] && text=$(transcribe_cli)
+
+	text=$(printf '%s\n' "$text" |
+		sed -e 's/\[[A-Z_ ]*\]//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+		grep -v '^$' | paste -sd ' ')
+
+	if [ -z "$text" ]; then
+		notify dialog-warning "No speech recognised" -t 3000
+		return
+	fi
+
+	detect_layout
+	export DOTOOL_XKB_LAYOUT DOTOOL_XKB_VARIANT
+	case $DICTATE_OUTPUT in
+	print)
+		printf '%s\n' "$text"
+		;;
+	paste)
+		printf '%s' "$text" | wl-copy
+		echo "key ctrl+v" | dotool
+		;;
+	*)
+		# dotool's "type" takes the rest of the line; newlines already removed
+		printf 'typedelay 4\ntypehold 4\ntype %s\n' "$text" | dotool 2>>"$LOG"
+		;;
+	esac
+	close_notify
+}
+
+server() {
+	local model hostport host port
+	model=$(pick_model) || exit 1
+	hostport=${DICTATE_SERVER#*://}
+	hostport=${hostport%%/*}
+	host=${hostport%:*}
+	port=${hostport##*:}
+	exec whisper-server -m "$model" -t "$DICTATE_THREADS" \
+		--host "$host" --port "$port"
+}
+
+case ${1:-toggle} in
+toggle)
+	if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+		stop
+	else
+		start
+	fi
+	;;
+server)
+	server
+	;;
+*)
+	echo "usage: dictate [toggle|server]" >&2
+	exit 2
+	;;
+esac

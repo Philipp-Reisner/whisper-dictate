@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Dictate
+Comment=Toggle voice dictation (whisper.cpp) into the focused window
+Exec=/usr/bin/dictate toggle
+Icon=audio-input-microphone
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+X-KDE-Shortcuts=Meta+Space

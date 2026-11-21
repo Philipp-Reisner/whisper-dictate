@@ -1,0 +1,11 @@
+[Unit]
+Description=whisper.cpp server for dictate (keeps the speech model loaded)
+Documentation=https://github.com/Philipp-Reisner/whisper-dictate
+
+[Service]
+ExecStart=/usr/bin/dictate server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
