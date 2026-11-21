@@ -7,7 +7,7 @@
 
 Name:           whisper-dictate
 Version:        1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Offline voice dictation into any window with whisper.cpp
 
 License:        MIT
@@ -64,6 +64,10 @@ install -D -p -m 0644 %{SOURCE3} %{buildroot}%{_userunitdir}/dictate-server.serv
 %{_userunitdir}/dictate-server.service
 
 %changelog
+* Sat Nov 21 2026 Philipp Reisner <phil@localhost> - 1.0-2
+- Do not re-declare all shell variables when no DICTATE_* variable is set
+  in the environment
+
 * Sat Nov 21 2026 Philipp Reisner <phil@localhost> - 1.0-1
 - Initial package: dictate toggle script, whisper-server user service,
   Meta+Space shortcut

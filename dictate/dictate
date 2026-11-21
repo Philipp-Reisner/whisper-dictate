@@ -18,7 +18,10 @@ set -u
 MODELDIR=/usr/share/whisper-cpp/models
 
 # Remember settings from the environment: they win over the config files.
-env_settings=$(declare -p ${!DICTATE_*} ${!DOTOOL_XKB_*} 2>/dev/null)
+# (declare -p without names would dump all variables.)
+env_names=(${!DICTATE_*} ${!DOTOOL_XKB_*})
+env_settings=
+[ ${#env_names[@]} -gt 0 ] && env_settings=$(declare -p "${env_names[@]}")
 
 # Defaults, see /etc/dictate.conf
 DICTATE_MODEL=
