@@ -99,6 +99,20 @@ curl -F file=@/tmp/t16.wav -F response_format=text -F language=auto \
 - First characters missing: `DICTATE_OUTPUT=paste` (not in Konsole: Ctrl+Shift+V).
 - Meta+Space does nothing: *System Settings → Shortcuts → Dictate*; a
   `~/.local/share/applications/dictate.desktop` overrides the system one.
+- Switching from a personal setup (`~/.local/bin/dictate` +
+  `~/.local/share/applications/dictate.desktop`) to the package: after
+  removing the personal files, Meta+Space fails with "Der Dienst Dictate
+  kann nicht ausführbar gemacht werden" / "Programm … nicht auffindbar".
+  KWin (which hosts kglobalaccel on Plasma 6) keeps the path and `Exec=`
+  line it registered at login; `kbuildsycoca6` does not change that. Log
+  out and in. Until then, symlinks at the old paths keep it working:
+
+  ```sh
+  ln -s /usr/share/applications/dictate.desktop ~/.local/share/applications/dictate.desktop
+  ln -s /usr/bin/dictate ~/.local/bin/dictate
+  # after the next login:
+  rm ~/.local/share/applications/dictate.desktop ~/.local/bin/dictate
+  ```
 
 ## Building
 
