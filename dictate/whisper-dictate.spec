@@ -7,7 +7,7 @@
 
 Name:           whisper-dictate
 Version:        1.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Offline voice dictation into any window with whisper.cpp
 
 License:        MIT
@@ -25,6 +25,10 @@ Requires:       whisper-cpp-vulkan >= 1.9.5-2
 Requires:       (whisper-cpp-model-large-v3-turbo or whisper-cpp-model-large-v3)
 Recommends:     whisper-cpp-model-large-v3-turbo
 Requires:       dotool
+Requires:       kdotool
+Requires:       util-linux-core
+Requires:       gawk
+Requires:       grep
 Requires:       pipewire-utils
 Requires:       wl-clipboard
 Requires:       libnotify
@@ -64,6 +68,15 @@ install -D -p -m 0644 %{SOURCE3} %{buildroot}%{_userunitdir}/dictate-server.serv
 %{_userunitdir}/dictate-server.service
 
 %changelog
+* Tue Nov 24 2026 Philipp Reisner <phil@localhost> - 1.0-3
+- Block global shortcuts and release modifiers while typing: with Meta
+  still held the text triggered shortcuts and every space re-toggled dictate
+- Type only into the window focused when the recording stopped, not into
+  the desktop, panel or lock screen; otherwise copy to the clipboard
+- Drop typical whisper hallucinations (subtitle credits, Cyrillic
+  "Спасибо", non-Latin script, a word looping)
+- One toggle at a time (flock), ignore toggles 1 s after a dictation
+
 * Sat Nov 21 2026 Philipp Reisner <phil@localhost> - 1.0-2
 - Do not re-declare all shell variables when no DICTATE_* variable is set
   in the environment

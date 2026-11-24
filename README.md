@@ -67,6 +67,19 @@ Meta+Space ─► dictate toggle
   of 256 give correct results (others produce garbage), so it rounds up.
 - **Vocabulary prompt**: names and terms in `DICTATE_PROMPT` are spelled
   correctly much more often ("DRBD" instead of "der BD").
+- **Safety**: uinput keys are real key presses for KWin, and KWin checks
+  global shortcuts first. With Meta still held, a dictated text once became
+  a burst of Meta+E, Meta+L, … and every space a Meta+Space that toggled
+  dictate again. So `dictate`
+  - blocks global shortcuts (kglobalaccel `blockGlobalShortcuts`) and
+    releases modifiers while it types,
+  - types only into the window that had the focus when the recording
+    stopped, and not into the desktop, panel, KRunner or lock screen
+    (checked with kdotool); otherwise the text goes to the clipboard,
+  - drops typical whisper hallucinations (subtitle credits, "Спасибо",
+    non-Latin script, one word looping),
+  - runs one toggle at a time (`flock`) and ignores Meta+Space for 1 s
+    after a dictation.
 
 ## Configuration
 
@@ -96,6 +109,11 @@ curl -F file=@/tmp/t16.wav -F response_format=text -F language=auto \
 - Log: `$XDG_RUNTIME_DIR/dictate/log`; server: `journalctl --user -u dictate-server`.
 - Nothing typed, but no error: check `/dev/uinput` access (see above).
 - Wrong characters/umlauts: set `DOTOOL_XKB_LAYOUT` / `DOTOOL_XKB_VARIANT`.
+- "Not typed …, the text is in the clipboard" or "Nothing typed, …": the
+  focus or hallucination check refused; the log has the text and the
+  reason. See the safety settings in `/etc/dictate.conf`.
+- Global shortcuts dead after `dictate` was killed while typing:
+  `gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel -m org.kde.KGlobalAccel.blockGlobalShortcuts false`
 - First characters missing: `DICTATE_OUTPUT=paste` (not in Konsole: Ctrl+Shift+V).
 - Meta+Space does nothing: *System Settings → Shortcuts → Dictate*; a
   `~/.local/share/applications/dictate.desktop` overrides the system one.

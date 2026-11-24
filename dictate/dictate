@@ -32,6 +32,12 @@ DICTATE_THREADS=$(( $(nproc) / 2 ))
 DICTATE_SERVER=http://127.0.0.1:8178
 DICTATE_SERVER_WAIT=30
 DICTATE_AUDIO_CTX=auto
+DICTATE_CHECK_FOCUS=1
+DICTATE_DENY_CLASSES='plasmashell|org\.kde\.plasmashell|kscreenlocker_greet|krunner|org\.kde\.krunner'
+DICTATE_SCRIPTS='Latin'
+DICTATE_REJECT='спасибо|продолжение следует|untertitel (von|im auftrag|der amara)|amara\.org|fürs zuschauen|thanks? (you )?for watching'
+DICTATE_MAX_REPEAT=4
+DICTATE_DEBOUNCE=1
 DOTOOL_XKB_LAYOUT=
 DOTOOL_XKB_VARIANT=
 
@@ -46,7 +52,13 @@ mkdir -p "$STATE"
 PIDFILE=$STATE/rec.pid
 WAV=$STATE/rec.wav
 NIDFILE=$STATE/notify.id
+LOCKFILE=$STATE/lock
+LASTFILE=$STATE/last
 LOG=$STATE/log
+
+log() {
+	echo "$(date '+%F %T') $*" >>"$LOG"
+}
 
 # First existing model in order of preference
 pick_model() {
@@ -142,9 +154,128 @@ transcribe_cli() {
 		--prompt "$DICTATE_PROMPT" -nt -np -f "$WAV" 2>>"$LOG"
 }
 
+active_window() {
+	kdotool getactivewindow 2>/dev/null
+}
+
+screen_locked() {
+	gdbus call --session -d org.freedesktop.ScreenSaver -o /ScreenSaver \
+		-m org.freedesktop.ScreenSaver.GetActive 2>/dev/null | grep -q true
+}
+
+# Synthetic keys must reach a text window, never the desktop, the panel,
+# the lock screen or another window than the one dictated into. Prints the
+# reason and succeeds if typing is not safe.
+focus_problem() {	# focus_problem <window focused when recording stopped>
+	local win cls
+	[ "$DICTATE_CHECK_FOCUS" = 1 ] || return 1
+	if screen_locked; then
+		echo "the screen is locked"
+		return 0
+	fi
+	if ! command -v kdotool >/dev/null; then
+		echo "kdotool is not installed, cannot check the focused window"
+		return 0
+	fi
+	win=$(active_window)
+	if [ -z "$win" ]; then
+		echo "no window has the focus"
+		return 0
+	fi
+	if [ -n "$1" ] && [ "$win" != "$1" ]; then
+		echo "the focus moved to another window"
+		return 0
+	fi
+	cls=$(kdotool getwindowclassname "$win" 2>/dev/null)
+	if [ -z "$cls" ] || printf '%s\n' "$cls" | grep -qxE "$DICTATE_DENY_CLASSES"; then
+		echo "the focused window (${cls:-unknown}) takes no text"
+		return 0
+	fi
+	return 1
+}
+
+# Whisper invents text on silence or noise: subtitle credits, "thanks for
+# watching", Russian "Спасибо", or one word looping. Prints the reason and
+# succeeds if the transcript looks like such a hallucination.
+hallucination() {	# hallucination <text>
+	local t=$1 class='\p{Common}\p{Inherited}' s n
+	if [ -n "$DICTATE_REJECT" ] && grep -qiE "$DICTATE_REJECT" <<<"$t"; then
+		echo "known whisper hallucination"
+		return 0
+	fi
+	if [ -n "$DICTATE_SCRIPTS" ]; then
+		for s in $DICTATE_SCRIPTS; do class+="\\p{$s}"; done
+		if grep -qP "[^$class]" <<<"$t"; then
+			echo "characters outside the scripts $DICTATE_SCRIPTS"
+			return 0
+		fi
+	fi
+	if [ "${DICTATE_MAX_REPEAT:-0}" -gt 0 ]; then
+		n=$(awk '{
+			for (i = 1; i <= NF; i++) {
+				w = tolower($i); gsub(/[[:punct:]]/, "", w)
+				run = (w != "" && w == prev) ? run + 1 : 1
+				if (run > max) max = run
+				prev = w
+			}
+		} END { print max + 0 }' <<<"$t")
+		if [ "$n" -ge "$DICTATE_MAX_REPEAT" ]; then
+			echo "one word repeated $n times"
+			return 0
+		fi
+	fi
+	return 1
+}
+
+shortcuts_blocked() {	# shortcuts_blocked true|false
+	gdbus call --session -d org.kde.kglobalaccel -o /kglobalaccel \
+		-m org.kde.KGlobalAccel.blockGlobalShortcuts "$1" >/dev/null 2>&1
+}
+
+# Type (or paste) the text with global shortcuts blocked: if a modifier is
+# still held, the synthetic keys would otherwise trigger shortcuts (with
+# Meta held, every space is Meta+Space and toggles dictate again).
+send_text() {	# send_text <text>
+	local text=$1
+	trap 'shortcuts_blocked false' EXIT
+	trap 'exit 1' INT TERM HUP
+	shortcuts_blocked true
+	{
+		# Release modifiers left over from the Meta+Space press
+		printf 'keyup %s\n' leftmeta rightmeta leftctrl rightctrl \
+			leftalt rightalt leftshift rightshift
+		case $DICTATE_OUTPUT in
+		paste)
+			# wl-copy stays around to serve the clipboard: no lock fd
+			printf '%s' "$text" | wl-copy 9>&-
+			echo "key ctrl+v"
+			;;
+		*)
+			# "type" takes the rest of the line; newlines already removed
+			printf 'typedelay 4\ntypehold 4\ntype %s\n' "$text"
+			;;
+		esac
+	} | dotool 2>>"$LOG"
+	# Let KWin process the last key events before shortcuts are live again
+	sleep 0.2
+	shortcuts_blocked false
+	trap - EXIT INT TERM HUP
+}
+
+now_ms() {
+	date +%s%3N
+}
+
 start() {
+	local last
+	last=$(cat "$LASTFILE" 2>/dev/null)
+	if [ -n "$last" ] && [ $(( $(now_ms) - last )) -lt $(( DICTATE_DEBOUNCE * 1000 )) ]; then
+		log "toggle ignored: less than ${DICTATE_DEBOUNCE}s after the last dictation"
+		return
+	fi
 	rm -f "$WAV" "$NIDFILE"
-	pw-record --rate 16000 --channels 1 --format s16 "$WAV" >>"$LOG" 2>&1 &
+	# 9>&-: the recorder must not hold the toggle lock
+	pw-record --rate 16000 --channels 1 --format s16 "$WAV" >>"$LOG" 2>&1 9>&- &
 	echo $! > "$PIDFILE"
 	notify audio-input-microphone "🎙 Recording… press Meta+Space to stop" -u critical
 	# Load the model while the user speaks
@@ -154,10 +285,12 @@ start() {
 }
 
 stop() {
-	local pid text i
+	local pid text i win= why
 	pid=$(cat "$PIDFILE")
 	rm -f "$PIDFILE"
 	kill -INT "$pid" 2>/dev/null
+	# The window the text is meant for: focused when the user stops
+	[ "$DICTATE_CHECK_FOCUS" = 1 ] && win=$(active_window)
 	while kill -0 "$pid" 2>/dev/null; do sleep 0.05; done
 
 	if [ ! -s "$WAV" ] || [ "$(stat -c %s "$WAV")" -lt 16000 ]; then
@@ -191,21 +324,28 @@ stop() {
 		return
 	fi
 
+	if why=$(hallucination "$text"); then
+		log "rejected ($why): $text"
+		notify dialog-warning "Nothing typed, $why: ${text:0:80}" -t 5000
+		return
+	fi
+
+	if [ "$DICTATE_OUTPUT" = print ]; then
+		printf '%s\n' "$text"
+		close_notify
+		return
+	fi
+
+	if why=$(focus_problem "$win"); then
+		log "not typed ($why): $text"
+		printf '%s' "$text" | wl-copy 9>&-
+		notify edit-paste "Not typed, $why. The text is in the clipboard." -t 5000
+		return
+	fi
+
 	detect_layout
 	export DOTOOL_XKB_LAYOUT DOTOOL_XKB_VARIANT
-	case $DICTATE_OUTPUT in
-	print)
-		printf '%s\n' "$text"
-		;;
-	paste)
-		printf '%s' "$text" | wl-copy
-		echo "key ctrl+v" | dotool
-		;;
-	*)
-		# dotool's "type" takes the rest of the line; newlines already removed
-		printf 'typedelay 4\ntypehold 4\ntype %s\n' "$text" | dotool 2>>"$LOG"
-		;;
-	esac
+	send_text "$text"
 	close_notify
 }
 
@@ -222,8 +362,16 @@ server() {
 
 case ${1:-toggle} in
 toggle)
+	# One toggle at a time: a press while the previous one is still
+	# transcribing or typing is dropped, not queued.
+	exec 9>"$LOCKFILE"
+	if ! flock -n 9; then
+		log "toggle ignored: busy"
+		exit 0
+	fi
 	if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
 		stop
+		now_ms > "$LASTFILE"
 	else
 		start
 	fi
